@@ -11,6 +11,7 @@
 #include <tchar.h>
 #include <opencv2\opencv.hpp>
 #include <opencv2\aruco.hpp>
+#include <deque>
 
 
 // TODO: reference additional headers your program requires here
