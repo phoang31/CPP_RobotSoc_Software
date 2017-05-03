@@ -9,13 +9,21 @@ using namespace aruco;
 
 const int FPS = 30;
 const int WAITKEY_DELAY_MS = 1000 / FPS;
-const int CAMERA_INDEX = 0;//webcamera. 1==external camera(usually)
+const int CAMERA_INDEX = 1;//webcamera. 1==external camera(usually)
 const float ARUCO_SQUARE_LENGTH = 0.076f;//7.6cm marker side length
-const string CALIB_CONSTANTS_FILEPATH = "Camera_calibration_constants_laptop.txt";
+const string CALIB_CONSTANTS_FILEPATH = "Camera_calibration_constants_projectCamera.txt";
 const int CORNER_MARKER_ID_0 = 0;
 const int CORNER_MARKER_ID_1 = 1;
 const int ROBOT_MARKER_ID = 2;
 const int MAX_PATH_BUFFER_LENGTH = 20;//must be greater than or equal to 2
+
+const String CONTROLS_WINDOW_NAME = "Ball Tracking Controls";
+const String CAMERA_WINDOW_NAME = "Camera Feed";
+const int CANNY_UPPER_THRESH_MAX = 255;
+const int CENTER_THRESH_MAX = 100;
+const int BALL_MIN_RADIUS_MAX = 100;
+const int BALL_MAX_RADIUS_MAX = 100;
+const int BLUR_KERNEL_RADIUS_MAX = 10;
 
 void calculateMarkerCenterAndAngle(vector<int> markerIDs, vector<vector<Point2f>> markerCorners, vector<Point2f> &markerCenters, vector<float> &angles);
 int startWebcamMonitoring(const Mat cameraMatrix, const Mat distortionCoeffs, float arucoSquareSideLength);
@@ -23,18 +31,36 @@ bool readCameraCalibration(string fname, Mat& cameraMatrix, Mat& distortionCoeff
 vector<Point2f> drawFieldCorners(Mat frame, vector<int> markerIDs, vector<Point2f> markerCenters);
 int findRobotIndex(vector<int> markerIDs);
 void drawPath(Mat frame, Point2f newLocation, deque<Point2f> &locationsBuffer);
+Point2f trackCircles(Mat frame, int &cannyUpperThreshValue,
+	int &centerDetectionThreshValue, int &minBallRadiusValue, int &maxBallRadiusValue, int &blurKernelRadiusValue);
 
 //search through frames for aruco markers and draw orientation axes
 int startWebcamMonitoring(const Mat cameraMatrix, const Mat distortionCoeffs, float arucoSquareSideLength)
 {
-	Mat grabbed, frame;//frame to search for aruco markers
+	Mat grabbed, frame, gray;//frame to search for aruco markers and ball
 	vector<Point2f> markerCenters, fieldCorners;
+	Point2f circleCenter;
 	vector<float> markerThetas;
 	vector<int> markerIDs;
 	vector<vector<Point2f>> markerCorners, rejectedCandidates;
+	vector<Vec3f> circles;
 	deque<Point2f> robotLocationsBuffer, ballLocationsBuffer;
 	int robotIndex;
+	int cannyUpperThreshValue = 100;
+	int centerDetectionThreshValue = 24;
+	int minBallRadiusValue = 9;
+	int maxBallRadiusValue = 15;
+	int blurKernelRadiusValue = 1;
 
+	//control window
+	namedWindow(CONTROLS_WINDOW_NAME, WINDOW_AUTOSIZE); // Create Window for trackbar
+	createTrackbar("Canny Thresh.", CONTROLS_WINDOW_NAME, &cannyUpperThreshValue, CANNY_UPPER_THRESH_MAX);
+	createTrackbar("Center Thresh.", CONTROLS_WINDOW_NAME, &centerDetectionThreshValue, CENTER_THRESH_MAX);
+	createTrackbar("Ball min. radius", CONTROLS_WINDOW_NAME, &minBallRadiusValue, BALL_MIN_RADIUS_MAX);
+	createTrackbar("Ball max. radius", CONTROLS_WINDOW_NAME, &maxBallRadiusValue, BALL_MAX_RADIUS_MAX);
+	createTrackbar("Blur kernel radius", CONTROLS_WINDOW_NAME, &blurKernelRadiusValue, BLUR_KERNEL_RADIUS_MAX);
+
+	//marker tracking
 	Ptr<DetectorParameters> parameters = DetectorParameters::create();			//using default detector parameters for now
 
 	Ptr<Dictionary> markerDictionary = getPredefinedDictionary(DICT_4X4_50);	//using small dictionary for fast results
@@ -69,7 +95,7 @@ int startWebcamMonitoring(const Mat cameraMatrix, const Mat distortionCoeffs, fl
 			cout << Mat(markerIDs) << endl;
 		}
 
-		
+		//track the robot
 		calculateMarkerCenterAndAngle(markerIDs, markerCorners, markerCenters, markerThetas);
 		robotIndex = findRobotIndex(markerIDs);//check if the robot is in the frame, draw its path if so.
 		if (robotIndex >= 0)
@@ -77,6 +103,14 @@ int startWebcamMonitoring(const Mat cameraMatrix, const Mat distortionCoeffs, fl
 			drawPath(frame, markerCenters[robotIndex], robotLocationsBuffer);
 		}
 
+		//track the ball
+		circleCenter = trackCircles(frame, cannyUpperThreshValue, centerDetectionThreshValue, minBallRadiusValue, maxBallRadiusValue, blurKernelRadiusValue);
+		if (circleCenter != Point2f(-1, -1))
+		{
+			drawPath(frame, circleCenter, ballLocationsBuffer);
+		}
+
+		//draw the field
 		fieldCorners = drawFieldCorners(frame, markerIDs, markerCenters);
 		if (fieldCorners.size() > 1)//print only if two corners were found
 		{
@@ -84,7 +118,7 @@ int startWebcamMonitoring(const Mat cameraMatrix, const Mat distortionCoeffs, fl
 		}
 		
 		resize(frame, frame, Size(960, 720));
-		imshow("Camera feed", frame);
+		imshow(CAMERA_WINDOW_NAME, frame);
 
 		char keypress = waitKey(WAITKEY_DELAY_MS);
 		if(keypress > 0)
@@ -242,8 +276,36 @@ void drawPath(Mat frame, Point2f newLocation, deque<Point2f> &locationsBuffer)
 		locationsBuffer.pop_front();//start removing oldest items
 		for (int i = 0; i < (locationsBuffer.size() - 1); i++)//buffer size should already be >= 2
 		{
-			line(frame, locationsBuffer[i], locationsBuffer[i + 1], Scalar(0,0,((32*i) % 256)), 3);
+			line(frame, locationsBuffer[i], locationsBuffer[i + 1], Scalar(0,0,((64*i) % 256)), 3);
 		}
+	}
+}
+
+
+Point2f trackCircles(Mat frame, int &cannyUpperThreshValue,
+	int &centerDetectionThreshValue, int &minBallRadiusValue, int &maxBallRadiusValue, int &blurKernelRadiusValue)
+{
+	vector<Vec3f> circles;
+	Mat gray;
+	cvtColor(frame, gray, COLOR_BGR2GRAY);
+	medianBlur(gray, gray, blurKernelRadiusValue * 2 + 1);//apply a blur to the gray frame to help find circles
+
+	HoughCircles(gray, circles, HOUGH_GRADIENT, 1,
+		gray.rows / 16,//alter this to detect circles with different distances from eachother
+		cannyUpperThreshValue + 1, centerDetectionThreshValue + 1, minBallRadiusValue, maxBallRadiusValue);//alter last two parameters for min/max ball size
+
+	if (circles.size() > 0)
+	{
+		Point2f c = { circles[0][0], circles[0][1] };
+		circle(gray, Point(c.x, c.y), circles[0][2], Scalar(0, 0, 255), 3, LINE_AA);
+		imshow("blurred grayscale", gray);
+		circle(frame, Point(c.x, c.y), 2, Scalar(0, 255, 0), 3, LINE_AA);
+		cout << "Ball found @ : " << c << endl;
+		return c;
+	}
+	else
+	{
+		return Point2f(-1, -1);//no circles found
 	}
 }
 
